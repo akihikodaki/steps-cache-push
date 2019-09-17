@@ -135,6 +135,15 @@ inputs:
       value_options:
       - "true"
       - "false"
+  - pipe: "false"
+    opts:
+      title: "Pipe cache?"
+      summary: "If Pipe cache is set to `true`, then it will pipe cache instead of writing to disk."
+      description: |-
+        If Pipe cache is set to `true`, then it will pipe cache instead of writing to disk.
+        This allows to send cache without consuming additional disk space. However, it
+        disables retry behavior. Its file size report may also be inaccurate. These
+        effectively reduces the reliability.
   - bitrise_cache_include_paths: $BITRISE_CACHE_INCLUDE_PATHS
     opts:
       title: "Cache paths collected by steps"

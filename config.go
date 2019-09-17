@@ -15,6 +15,7 @@ type Config struct {
 	CompressArchive     string `env:"compress_archive,opt[true,false]"`
 	DebugMode           string `env:"is_debug_mode,opt[true,false]"`
 	StackID             string `env:"BITRISE_STACK_ID"`
+	Pipe                string `env:"pipe,opt[true,false]"`
 }
 
 // ParseConfig expands the step inputs from the current environment

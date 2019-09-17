@@ -11,6 +11,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -24,9 +25,55 @@ const (
 	stackVersionsPath = "/tmp/archive_info.json"
 )
 
+type sizeWriteCloser int64
+
+func (writer *sizeWriteCloser) Write(b []byte) (int, error) {
+	*writer += sizeWriteCloser(len(b))
+	return len(b), nil
+}
+
+func (writer *sizeWriteCloser) Close() error {
+	return nil
+}
+
 func logErrorfAndExit(format string, args ...interface{}) {
 	log.Errorf(format, args...)
 	os.Exit(1)
+}
+
+func writeArchive(descriptor map[string]string, stackData []byte, compress bool, dry bool, writer io.WriteCloser, pths []string) {
+	// Generate cache archive
+	startTime := time.Now()
+
+	if !dry {
+		log.Infof("Generating cache archive")
+	}
+
+	archive, err := NewArchive(writer, compress)
+	if err != nil {
+		logErrorfAndExit("Failed to create archive: %s", err)
+	}
+
+	// This is the first file written, to speed up reading it in subsequent builds
+	if err = archive.writeData(stackData, stackVersionsPath); err != nil {
+		logErrorfAndExit("Failed to write cache info to archive, error: %s", err)
+	}
+
+	if err := archive.Write(pths, dry); err != nil {
+		logErrorfAndExit("Failed to populate archive: %s", err)
+	}
+
+	if err := archive.WriteHeader(descriptor, cacheInfoFilePath); err != nil {
+		logErrorfAndExit("Failed to write archive header: %s", err)
+	}
+
+	if err := archive.Close(); err != nil {
+		logErrorfAndExit("Failed to close archive: %s", err)
+	}
+
+	if !dry {
+		log.Donef("Done in %s\n", time.Since(startTime))
+	}
 }
 
 func main() {
@@ -39,6 +86,9 @@ func main() {
 
 	configs.Print()
 	fmt.Println()
+
+	compress := configs.CompressArchive == "true"
+	pipe := configs.Pipe == "true"
 
 	// Cleaning paths
 	startTime := time.Now()
@@ -136,16 +186,6 @@ func main() {
 		}
 	}
 
-	// Generate cache archive
-	startTime = time.Now()
-
-	log.Infof("Generating cache archive")
-
-	archive, err := NewArchive(cacheArchivePath, configs.CompressArchive == "true")
-	if err != nil {
-		logErrorfAndExit("Failed to create archive: %s", err)
-	}
-
 	var pths []string
 	for pth := range indicatorByPth {
 		pths = append(pths, pth)
@@ -155,31 +195,35 @@ func main() {
 	if err != nil {
 		logErrorfAndExit("Failed to get stack version info: %s", err)
 	}
-	// This is the first file written, to speed up reading it in subsequent builds
-	if err = archive.writeData(stackData, stackVersionsPath); err != nil {
-		logErrorfAndExit("Failed to write cache info to archive, error: %s", err)
-	}
 
-	if err := archive.Write(pths); err != nil {
-		logErrorfAndExit("Failed to populate archive: %s", err)
-	}
+	var reader io.Reader
+	var writer io.WriteCloser
 
-	if err := archive.WriteHeader(curDescriptor, cacheInfoFilePath); err != nil {
-		logErrorfAndExit("Failed to write archive header: %s", err)
-	}
+	if pipe {
+		reader, writer = io.Pipe()
+		go writeArchive(curDescriptor, stackData, false, compress, writer, pths)
+	} else {
+		writer, err = os.Create(cacheArchivePath)
+		if err != nil {
+			logErrorfAndExit("Failed to create cache archive: %s", err)
+		}
 
-	if err := archive.Close(); err != nil {
-		logErrorfAndExit("Failed to close archive: %s", err)
+		writeArchive(curDescriptor, stackData, false, compress, writer, pths)
 	}
-
-	log.Donef("Done in %s\n", time.Since(startTime))
 
 	// Upload cache archive
 	startTime = time.Now()
 
 	log.Infof("Uploading cache archive")
 
-	if err := uploadArchive(cacheArchivePath, configs.CacheAPIURL); err != nil {
+	if pipe {
+		archiveSizeWriteCloser := sizeWriteCloser(0)
+		writeArchive(curDescriptor, stackData, true, false, &archiveSizeWriteCloser, pths)
+		err = uploadArchiveReader(reader, int64(archiveSizeWriteCloser), configs.CacheAPIURL)
+	} else {
+		err = uploadArchiveFile(cacheArchivePath, configs.CacheAPIURL)
+	}
+	if err != nil {
 		logErrorfAndExit("Failed to upload archive: %s", err)
 	}
 	log.Donef("Done in %s\n", time.Since(startTime))

@@ -21,41 +21,43 @@ import (
 
 // Archive represents a cache archive.
 type Archive struct {
-	file *os.File
+	io   io.WriteCloser
 	tar  *tar.Writer
 	gzip *gzip.Writer
 }
 
-// NewArchive creates a instance of Archive.
-func NewArchive(pth string, compress bool) (*Archive, error) {
-	file, err := os.Create(pth)
-	if err != nil {
-		return nil, err
-	}
+type nopReader struct{}
 
+func (reader nopReader) Read(b []byte) (n int, err error) {
+	return len(b), nil
+}
+
+// NewArchive creates a instance of Archive.
+func NewArchive(io io.WriteCloser, compress bool) (*Archive, error) {
 	var tarWriter *tar.Writer
 	var gzipWriter *gzip.Writer
+	var err error
 	if compress {
-		gzipWriter, err = gzip.NewWriterLevel(file, gzip.BestCompression)
+		gzipWriter, err = gzip.NewWriterLevel(io, gzip.BestCompression)
 		if err != nil {
 			return nil, err
 		}
 
 		tarWriter = tar.NewWriter(gzipWriter)
 	} else {
-		tarWriter = tar.NewWriter(file)
+		tarWriter = tar.NewWriter(io)
 	}
 	return &Archive{
-		file: file,
+		io:   io,
 		tar:  tarWriter,
 		gzip: gzipWriter,
 	}, nil
 }
 
 // Write writes the given files in the cache archive.
-func (a *Archive) Write(pths []string) error {
+func (a *Archive) Write(pths []string, dry bool) error {
 	for _, pth := range pths {
-		if err := a.writeOne(pth); err != nil {
+		if err := a.writeOne(pth, dry); err != nil {
 			return err
 		}
 	}
@@ -63,7 +65,7 @@ func (a *Archive) Write(pths []string) error {
 	return nil
 }
 
-func (a *Archive) writeOne(pth string) error {
+func (a *Archive) writeOne(pth string, dry bool) error {
 	info, err := os.Lstat(pth)
 	if err != nil {
 		return fmt.Errorf("failed to lstat(%s), error: %s", pth, err)
@@ -94,20 +96,26 @@ func (a *Archive) writeOne(pth string) error {
 		return nil
 	}
 
-	file, err := os.Open(pth)
-	if err != nil {
-		return fmt.Errorf("failed to open file(%s), error: %s", pth, err)
-	}
-
-	defer func() {
-		if err := file.Close(); err != nil {
-			log.Warnf("Failed to close file (%s): %s", pth, err)
+	if dry {
+		var reader nopReader
+		_, err = io.CopyN(a.tar, reader, info.Size())
+	} else {
+		file, err := os.Open(pth)
+		if err != nil {
+			return fmt.Errorf("failed to open file(%s), error: %s", pth, err)
 		}
-	}()
 
-	// Write writes to the current file in the tar archive. Write returns the error ErrWriteTooLong if more than Header.Size bytes are written after WriteHeader.
-	if _, err := io.CopyN(a.tar, file, info.Size()); err != nil && err != io.EOF {
-		return fmt.Errorf("failed to copy, error: %s, file: %s, size: %d for header: %v", err, file.Name(), info.Size(), header)
+		defer func() {
+			if err := file.Close(); err != nil {
+				log.Warnf("Failed to close file (%s): %s", pth, err)
+			}
+		}()
+
+		// Write writes to the current file in the tar archive. Write returns the error ErrWriteTooLong if more than Header.Size bytes are written after WriteHeader.
+		_, err = io.CopyN(a.tar, file, info.Size())
+	}
+	if err != nil && err != io.EOF {
+		return fmt.Errorf("failed to copy, error: %s, file: %s, size: %d for header: %v", err, info.Name(), info.Size(), header)
 	}
 
 	return nil
@@ -155,13 +163,13 @@ func (a *Archive) Close() error {
 		}
 	}
 
-	return a.file.Close()
+	return a.io.Close()
 }
 
 // uploadArchive uploads the archive file to a given destination.
 // If the destination is a local file path (url has a file:// scheme) this function copies the cache archive file to the destination.
 // Otherwise destination should point to the Bitrise cache API server, in this case the function has builtin retry logic with 3s sleep.
-func uploadArchive(pth, url string) error {
+func uploadArchiveFile(pth, url string) error {
 	if strings.HasPrefix(url, "file://") {
 		dst := strings.TrimPrefix(url, "file://")
 		dir := filepath.Dir(dst)
@@ -183,14 +191,23 @@ func uploadArchive(pth, url string) error {
 		return fmt.Errorf("failed to generate upload url: %s", err)
 	}
 
-	if err := tryToUploadArchive(uploadURL, pth); err != nil {
+	if err := tryToUploadArchiveFile(uploadURL, pth); err != nil {
 		fmt.Println()
 		log.Warnf("First upload attempt failed, retrying...")
 		fmt.Println()
 		time.Sleep(3000 * time.Millisecond)
-		return tryToUploadArchive(uploadURL, pth)
+		return tryToUploadArchiveFile(uploadURL, pth)
 	}
 	return nil
+}
+
+func uploadArchiveReader(reader io.Reader, sizeInBytes int64, url string) error {
+	uploadURL, err := getCacheUploadURL(url, sizeInBytes)
+	if err != nil {
+		return fmt.Errorf("failed to generate upload url: %s", err)
+	}
+
+	return tryToUploadArchiveReader(uploadURL, reader)
 }
 
 // getCacheUploadURL requests an upload url from the Bitrise cache API server.
@@ -230,7 +247,7 @@ func getCacheUploadURL(cacheAPIURL string, fileSizeInBytes int64) (string, error
 // tryToUploadArchive performs the cache upload.
 // If the destination is a local file path (url has a file:// scheme) this function copies the cache archive file to the destination.
 // Otherwise destination should be a remote url.
-func tryToUploadArchive(uploadURL string, archiveFilePath string) error {
+func tryToUploadArchiveFile(uploadURL string, archiveFilePath string) error {
 	archFile, err := os.Open(archiveFilePath)
 	if err != nil {
 		return fmt.Errorf("failed to open archive file for upload (%s): %s", archiveFilePath, err)
@@ -270,6 +287,24 @@ func tryToUploadArchive(uploadURL string, archiveFilePath string) error {
 	}
 
 	fileClosed = true
+
+	return nil
+}
+
+func tryToUploadArchiveReader(uploadURL string, archiveReader io.Reader) error {
+	req, err := http.NewRequest(http.MethodPut, uploadURL, archiveReader)
+	if err != nil {
+		return fmt.Errorf("failed to create upload request: %s", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to upload: %s", err)
+	}
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("upload failed with status code: %d", resp.StatusCode)
+	}
 
 	return nil
 }
